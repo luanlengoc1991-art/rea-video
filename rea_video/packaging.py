@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 
 from .media import VideoInfo, extract_frame, iter_frames
-from .overlay import get_ocr
+from .overlay import get_ocr, ocr_workers as overlay_ocr_workers
 from .util import LOG, read_image, write_image
 
 OCR_FPS = 2.0
@@ -306,14 +306,19 @@ def _band(cy: float) -> str:
 def ocr_pass(path: str | Path, info: VideoInfo, max_calls: int = OCR_MAX) -> tuple[list[dict], float]:
     """OCR the whole video at a fixed rate. Returns (items, step_seconds). Frames that did not change since the
     last OCR'd frame reuse its result."""
-    ocr = get_ocr()
-    if ocr is None or info.duration <= 0:
+    if get_ocr() is None or info.duration <= 0:
         return [], 0.0
     fps = min(OCR_FPS, max(0.5, max_calls / info.duration))
     portrait = (info.height > info.width) != (info.rotation in (90, 270))
     width = 720 if portrait else 1280
-    items: list[dict] = []
-    prev_small, prev = None, []
+    # Frames are decoded in order here; the ones that changed are read by several OCR engines at once (one per
+    # worker thread, see overlay.ocr_workers). onnxruntime runs outside the GIL. The order of the result, and every
+    # value in it, is the same as reading the frames one after another.
+    pool = _ocr_pool()
+    limit = 2 * overlay_ocr_workers()
+    plan: list[tuple[float, object]] = []  # (t, future of this frame) or (t, index of the plan entry it reuses)
+    pending: list = []
+    prev_small, last = None, -1
     for i, f in enumerate(iter_frames(path, info, width, fps=fps)):
         t = round(i / fps, 3)
         H, W = f.shape[:2]
@@ -321,29 +326,62 @@ def ocr_pass(path: str | Path, info: VideoInfo, max_calls: int = OCR_MAX) -> tup
         # reuse the last result only if no 8x8 block changed (a new subtitle line is a small local change)
         if prev_small is not None and small.shape == prev_small.shape and float(
                 cv2.absdiff(small, prev_small).reshape(small.shape[0] // 8, 8, small.shape[1] // 8, 8).mean(axis=(1, 3)).max()) < 2.0:
-            items += [dict(it, t=t) for it in prev]
+            plan.append((t, last))
             continue
         prev_small = small
-        try:
-            res, _ = ocr(f)
-        except Exception as exc:  # pragma: no cover
-            LOG.debug("ocr failed at %.2f: %s", t, exc)
-            res = None
-        cur = []
-        for box, text, conf in res or []:
-            if float(conf) < MIN_CONF or not re.search(r"[\w一-鿿]", text):
-                continue
-            pts = np.array(box, dtype=np.float32)
-            x0, y0 = pts.min(axis=0)
-            x1, y1 = pts.max(axis=0)
-            ang = float(np.degrees(np.arctan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0])))
-            bx = (int(x0), int(y0), int(x1), int(y1))
-            cur.append({"t": t, "text": text, "conf": round(float(conf), 3),
-                        "bbox": [round(x0 / W, 4), round(y0 / H, 4), round((x1 - x0) / W, 4), round((y1 - y0) / H, 4)],
-                        "angle": round(ang, 1), "style": text_style(f, bx)})
-        prev = cur
+        fut = pool.submit(_ocr_frame, f, t)
+        last = len(plan)
+        plan.append((t, fut))
+        pending.append(fut)
+        if len(pending) > limit:  # keep only a few decoded frames in memory
+            pending.pop(0).result()
+    items: list[dict] = []
+    done: list[list[dict]] = []
+    for t, ref in plan:
+        if isinstance(ref, int):
+            cur = [dict(it, t=t) for it in done[ref]] if ref >= 0 else []
+        else:
+            cur = ref.result()
+        done.append(cur)
         items += cur
     return items, 1.0 / fps
+
+
+_POOL = None
+
+
+def _ocr_pool():
+    """Threads of the OCR pass, kept for the life of the process so each keeps its OCR engine."""
+    global _POOL
+    if _POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _POOL = ThreadPoolExecutor(max_workers=overlay_ocr_workers(), thread_name_prefix="ocr")
+    return _POOL
+
+
+def _ocr_frame(f: np.ndarray, t: float) -> list[dict]:
+    """OCR one frame: the text lines kept, with box, angle and style (the same fields the pass always produced)."""
+    ocr = get_ocr()
+    H, W = f.shape[:2]
+    try:
+        res, _ = ocr(f) if ocr is not None else (None, 0)
+    except Exception as exc:  # pragma: no cover
+        LOG.debug("ocr failed at %.2f: %s", t, exc)
+        res = None
+    cur = []
+    for box, text, conf in res or []:
+        if float(conf) < MIN_CONF or not re.search(r"[\w一-鿿]", text):
+            continue
+        pts = np.array(box, dtype=np.float32)
+        x0, y0 = pts.min(axis=0)
+        x1, y1 = pts.max(axis=0)
+        ang = float(np.degrees(np.arctan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0])))
+        bx = (int(x0), int(y0), int(x1), int(y1))
+        cur.append({"t": t, "text": text, "conf": round(float(conf), 3),
+                    "bbox": [round(x0 / W, 4), round(y0 / H, 4), round((x1 - x0) / W, 4), round((y1 - y0) / H, 4)],
+                    "angle": round(ang, 1), "style": text_style(f, bx)})
+    return cur
 
 
 def _blocks(items: list[dict]) -> list[dict]:

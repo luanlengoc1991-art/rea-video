@@ -16,7 +16,12 @@ def fake_rapidocr(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "rapidocr_onnxruntime", types.SimpleNamespace(RapidOCR=RapidOCR))
     monkeypatch.setattr(overlay, "_OCR", {})
+    monkeypatch.setattr(overlay, "_GPU", {})
+    monkeypatch.setenv("REA_OCR_GPU", "0")
     return calls
+
+
+CPU = {"intra_op_num_threads": 1, "inter_op_num_threads": 1}  # a few threads per engine, not every core
 
 
 def test_default_language_is_zh(monkeypatch):
@@ -33,7 +38,7 @@ def test_unknown_language_is_rejected(monkeypatch):
 def test_zh_uses_bundled_model(monkeypatch, fake_rapidocr):
     monkeypatch.setenv("REA_OCR_LANG", "zh")
     assert overlay.get_ocr() is overlay.get_ocr()
-    assert fake_rapidocr == [{}]
+    assert fake_rapidocr == [CPU]
 
 
 def test_ja_uses_japanese_recognizer(monkeypatch, tmp_path, fake_rapidocr):
@@ -44,7 +49,7 @@ def test_ja_uses_japanese_recognizer(monkeypatch, tmp_path, fake_rapidocr):
     overlay.get_ocr()
     monkeypatch.setenv("REA_OCR_LANG", "zh")
     overlay.get_ocr()
-    assert fake_rapidocr == [{"rec_model_path": str(model)}, {}]  # one instance per language
+    assert fake_rapidocr == [{**CPU, "rec_model_path": str(model)}, CPU]  # one instance per language
 
 
 def test_cached_model_with_matching_checksum_is_not_downloaded(monkeypatch, tmp_path):
@@ -97,3 +102,33 @@ def test_rapidocr3_is_used_when_rapidocr_onnxruntime_is_missing(monkeypatch, tmp
     assert ocr(None)[0] is None  # nothing found: same as rapidocr-onnxruntime
     for box, text, conf in res:  # the shape overlay / packaging iterate over
         assert len(box) == 4 and text == "字幕" and conf == 0.9
+
+
+def test_each_thread_gets_its_own_cpu_engine(monkeypatch, fake_rapidocr):
+    import threading
+
+    monkeypatch.setenv("REA_OCR_LANG", "zh")
+    monkeypatch.delenv("REA_OCR_THREADS", raising=False)
+    main = overlay.get_ocr()
+    got = []
+    t = threading.Thread(target=lambda: got.append(overlay.get_ocr()))
+    t.start()
+    t.join()
+    assert got[0] is not main and len(fake_rapidocr) == 2
+
+
+def test_graphics_card_engine_is_shared_one_call_at_a_time(monkeypatch, fake_rapidocr):
+    monkeypatch.setenv("REA_OCR_LANG", "zh")
+    monkeypatch.setenv("REA_OCR_GPU", "1")
+    monkeypatch.setattr(overlay, "ocr_gpu", lambda: True)
+    used = []
+    monkeypatch.setattr(overlay, "_gpu_engine", lambda **kw: (lambda img: used.append("gpu") or ([], 0)))
+    eng = overlay.get_ocr()
+    eng(None)
+    assert used == ["gpu"] and fake_rapidocr == []  # no CPU engine made while the card is free
+    with overlay._GPU_USE:  # card busy: this thread falls back to its own CPU engine
+        try:
+            eng(None)
+        except TypeError:  # the fake CPU engine is not callable; reaching it is what this checks
+            pass
+    assert used == ["gpu"] and fake_rapidocr == [CPU]

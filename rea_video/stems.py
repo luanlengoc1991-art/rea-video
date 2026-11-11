@@ -56,13 +56,39 @@ def ensure_model(force: bool = False) -> Path:
 def _session():
     import onnxruntime as ort
 
+    # the separation runs alongside the shot analysis and the OCR pass: two threads, not every core (onnxruntime's
+    # default), which slows everything running beside it (measured on a 30 s clip: whole run 90 s with 6 threads,
+    # 77 s with 2). REA_STEMS_THREADS overrides.
+    opts = ort.SessionOptions()
     try:
-        return ort.InferenceSession(str(ensure_model()), providers=["CPUExecutionProvider"])
+        opts.intra_op_num_threads = max(1, int(os.environ.get("REA_STEMS_THREADS", "") or 2))
+    except ValueError:
+        opts.intra_op_num_threads = 2
+    opts.inter_op_num_threads = 1
+    # REA_STEMS_GPU=1 runs the model on the graphics card (DirectML). Off by default: it runs beside the OCR pass,
+    # and two threads running DirectML sessions at once crash the process.
+    gpu = os.environ.get("REA_STEMS_GPU", "0") == "1" and "DmlExecutionProvider" in ort.get_available_providers()
+    providers = ["DmlExecutionProvider", "CPUExecutionProvider"] if gpu else ["CPUExecutionProvider"]
+
+    def make(model: Path):
+        if gpu:
+            try:
+                o = ort.SessionOptions()
+                o.intra_op_num_threads, o.inter_op_num_threads = opts.intra_op_num_threads, 1
+                o.enable_mem_pattern = False  # required by DirectML
+                o.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                return ort.InferenceSession(str(model), sess_options=o, providers=providers)
+            except Exception as exc:  # pragma: no cover - depends on the graphics driver
+                LOG.warning("stems on the graphics card (DirectML) failed, using the CPU: %s", str(exc)[:160])
+        return ort.InferenceSession(str(model), sess_options=opts, providers=["CPUExecutionProvider"])
+
+    try:
+        return make(ensure_model())
     except Exception as e:  # corrupted cache (e.g. an older interrupted download): fetch again once
         if "protobuf" not in str(e).lower() and "load model" not in str(e).lower():
             raise
         LOG.warning("cached stem model is unreadable (%s); downloading again", str(e)[:120])
-        return ort.InferenceSession(str(ensure_model(force=True)), providers=["CPUExecutionProvider"])
+        return make(ensure_model(force=True))
 
 
 def load_stereo(path: str | Path) -> np.ndarray | None:

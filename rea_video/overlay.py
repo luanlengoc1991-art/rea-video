@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -89,24 +90,115 @@ class _RapidOCR3:
         return [[np.asarray(b).tolist(), t, float(s)] for b, t, s in zip(boxes, txts, scores)], out.elapse
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, "") or default))
+    except ValueError:
+        return default
+
+
+def ocr_gpu() -> bool:
+    """OCR on the graphics card through DirectML (Windows, `onnxruntime-directml` installed in place of
+    `onnxruntime`): about 6x faster than the CPU on text-heavy frames, with the same lines read. REA_OCR_GPU=0
+    turns it off."""
+    if os.environ.get("REA_OCR_GPU", "1") == "0":
+        return False
+    try:
+        import onnxruntime as ort
+
+        return "DmlExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
+
+
+def ocr_threads() -> int:
+    """CPU threads per OCR engine. onnxruntime's default (every core) is several times slower for these small
+    models, most of all on CPUs with performance and efficiency cores; one thread per engine with several engines
+    side by side (`ocr_workers`) reads frames about twice as fast. REA_OCR_THREADS overrides."""
+    return _env_int("REA_OCR_THREADS", 1)
+
+
+def ocr_workers() -> int:
+    """Frames OCR'd at the same time by the whole-video pass (one engine per worker). With a graphics card one
+    worker: the card reads a frame in a fraction of the time a CPU engine does, and CPU workers beside it only take
+    frames the card would have finished sooner (measured: 38 s alone, 76 s with CPU helpers). REA_OCR_WORKERS
+    overrides."""
+    cpu = max(1, min(4, (os.cpu_count() or 4) // 4))
+    return _env_int("REA_OCR_WORKERS", 1 if ocr_gpu() else cpu)
+
+
 def _ocr_engine(**kwargs):
+    """An OCR engine on the CPU (a few threads, see ocr_threads)."""
     try:
         from rapidocr_onnxruntime import RapidOCR  # type: ignore
     except ImportError:
         return _RapidOCR3(**kwargs)
-    return RapidOCR(**kwargs)
+    return RapidOCR(intra_op_num_threads=ocr_threads(), inter_op_num_threads=1, **kwargs)
+
+
+def _gpu_engine(**kwargs):
+    """An OCR engine on the graphics card (DirectML). Raises when the card cannot run the models."""
+    from rapidocr_onnxruntime import RapidOCR  # type: ignore
+
+    eng = RapidOCR(det_use_dml=True, cls_use_dml=True, rec_use_dml=True, intra_op_num_threads=ocr_threads(), inter_op_num_threads=1, **kwargs)
+    eng(np.full((96, 320, 3), 255, np.uint8))  # a card that cannot run the models fails here, not mid-video
+    return eng
+
+
+_OCR_LOCK = threading.Lock()
+_GPU: dict = {}  # language -> the one engine on the graphics card, or None when it could not start
+_GPU_USE = threading.Lock()  # DirectML crashes when two threads run sessions at once: one frame at a time on the card
+
+
+class _Shared:
+    """One thread's OCR when there is a graphics card: the card's engine whenever it is free, otherwise this
+    thread's own CPU engine (made the first time the card is busy)."""
+
+    def __init__(self, gpu, make_cpu):
+        self._gpu, self._make_cpu, self._cpu = gpu, make_cpu, None
+
+    def __call__(self, img):
+        if _GPU_USE.acquire(blocking=False):
+            try:
+                return self._gpu(img)
+            finally:
+                _GPU_USE.release()
+        if self._cpu is None:
+            self._cpu = self._make_cpu()
+        return self._cpu(img)
 
 
 def get_ocr():
+    """The OCR engine for the current language and thread (workers of the OCR pass never share a CPU session; the
+    graphics card's engine is shared, one call at a time). _OCR keeps one entry per (language, thread);
+    `_OCR[lang] = None` marks a language whose engine failed to load."""
     lang = ocr_lang()
-    if lang not in _OCR:
-        try:
-            kwargs = {"rec_model_path": str(rec_model(lang))} if lang in _REC_MODELS else {}
-            _OCR[lang] = _ocr_engine(**kwargs)
-        except Exception as exc:  # pragma: no cover - optional dependency / offline
-            LOG.warning("OCR disabled (pip install 'rea-video[ocr]' to enable; lang=%s): %s", lang, exc)
+    key = (lang, threading.get_ident())
+    with _OCR_LOCK:
+        if lang in _OCR and _OCR[lang] is None:
+            return None
+        if key in _OCR:
+            return _OCR[key]
+    try:
+        kwargs = {"rec_model_path": str(rec_model(lang))} if lang in _REC_MODELS else {}
+        with _OCR_LOCK:
+            if lang not in _GPU:
+                _GPU[lang] = None
+                if ocr_gpu():
+                    try:
+                        _GPU[lang] = _gpu_engine(**kwargs)
+                    except Exception as exc:  # pragma: no cover - depends on the graphics driver
+                        LOG.warning("OCR on the graphics card (DirectML) failed, using the CPU: %s", str(exc)[:160])
+        gpu = _GPU[lang]
+        eng = _Shared(gpu, lambda: _ocr_engine(**kwargs)) if gpu is not None else _ocr_engine(**kwargs)
+    except Exception as exc:  # pragma: no cover - optional dependency / offline
+        LOG.warning("OCR disabled (pip install 'rea-video[ocr]' to enable; lang=%s): %s", lang, exc)
+        with _OCR_LOCK:
             _OCR[lang] = None
-    return _OCR[lang]
+        return None
+    with _OCR_LOCK:
+        _OCR[key] = eng
+    return eng
 
 
 def _boxes_from_mask(mask: np.ndarray, min_area_frac: float = 0.002) -> list[list[int]]:
